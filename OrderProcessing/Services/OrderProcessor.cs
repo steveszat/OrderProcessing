@@ -2,77 +2,95 @@
 using OrderProcessing.Interfaces;
 using OrderProcessing.Models;
 
-namespace OrderProcessing.Services
+public class OrderProcessor : IOrderProcessor
 {
-    public class OrderProcessor : IOrderProcessor
+    private readonly IOrderService _orderService;
+    private readonly IAlertService _alertService;
+    private readonly ILogger<OrderProcessor> _logger;
+
+    public OrderProcessor(
+        IOrderService orderService,
+        IAlertService alertService,
+        ILogger<OrderProcessor> logger)
     {
-        private readonly IOrderService _orderService;
-        private readonly IAlertService _alertService;
-        private readonly ILogger<OrderProcessor> _logger;
+        _orderService = orderService ?? throw new ArgumentNullException(nameof(orderService));
+        _alertService = alertService ?? throw new ArgumentNullException(nameof(alertService));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+    }
 
-        public OrderProcessor(
-            IOrderService orderService,
-            IAlertService alertService,
-            ILogger<OrderProcessor> logger)
+    public async Task ProcessOrdersAsync(CancellationToken cancellationToken = default)
+    {
+        try
         {
-            _orderService = orderService ?? throw new ArgumentNullException(nameof(orderService));
-            _alertService = alertService ?? throw new ArgumentNullException(nameof(alertService));
-            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        }
+            _logger.LogInformation("Starting order processing");
+            var orders = await _orderService.FetchMedicalEquipmentOrdersAsync(cancellationToken);
 
-        public async Task ProcessOrdersAsync(CancellationToken cancellationToken = default)
-        {
-            try
+            foreach (var order in orders)
             {
-                _logger.LogInformation("Starting order processing");
-                var orders = await _orderService.FetchMedicalEquipmentOrdersAsync(cancellationToken);
-
-                foreach (var order in orders)
-                {
-                    await ProcessOrderAsync(order, cancellationToken);
-                }
-                _logger.LogInformation("Completed order processing");
+                await ProcessOrderAsync(order, cancellationToken);
             }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error during order processing");
-                throw;
-            }
+
+            _logger.LogInformation("Completed order processing");
         }
-
-        private async Task ProcessOrderAsync(Order order, CancellationToken cancellationToken)
+        catch (Exception ex)
         {
-            try
-            {
-                var hasDeliveredItems = false;
+            _logger.LogError(ex, "Error during order processing");
+            throw;
+        }
+    }
 
-                foreach (var item in order.Items.Where(IsItemDelivered))
+    private async Task ProcessOrderAsync(Order order, CancellationToken cancellationToken)
+    {
+        Exception? firstError = null;
+        var hasDeliveredItems = false;
+
+        foreach (var item in order.Items)
+        {
+            if (IsItemDelivered(item))
+            {
+                try
                 {
                     await _alertService.SendAlertMessageAsync(order.OrderId, item, cancellationToken);
                     IncrementDeliveryNotification(item);
                     hasDeliveredItems = true;
                 }
-
-                if (hasDeliveredItems)
+                catch (Exception ex) when (ex is not OperationCanceledException)
                 {
-                    await _orderService.UpdateOrderAsync(order, cancellationToken);
+                    _logger.LogError(ex,
+                        "Error processing item {Description} in order {OrderId}",
+                        item.Description, order.OrderId);
+                    firstError = ex;
+                    // Continue processing other items
                 }
             }
-            catch (Exception ex)
+        }
+
+        if (hasDeliveredItems && firstError == null)
+        {
+            try
             {
-                _logger.LogError(ex, "Error processing order {OrderId}", order.OrderId);
-                throw;
+                await _orderService.UpdateOrderAsync(order, cancellationToken);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogError(ex, "Failed to update order {OrderId}", order.OrderId);
+                firstError = ex;
             }
         }
 
-        private static bool IsItemDelivered(OrderItem item)
+        if (firstError != null)
         {
-            return item.Status.Equals("Delivered", StringComparison.OrdinalIgnoreCase);
+            throw firstError;
         }
+    }
 
-        private static void IncrementDeliveryNotification(OrderItem item)
-        {
-            item.DeliveryNotification++;
-        }
+    private static bool IsItemDelivered(OrderItem item)
+    {
+        return item.Status.Equals("Delivered", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void IncrementDeliveryNotification(OrderItem item)
+    {
+        item.DeliveryNotification++;
     }
 }
